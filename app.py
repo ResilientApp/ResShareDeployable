@@ -1,6 +1,7 @@
 import hashlib
 import json
 from io import BytesIO
+import zipfile
 
 from flask import Flask, request, jsonify, session, send_file
 from functools import wraps
@@ -33,22 +34,34 @@ additional_origins = os.environ.get('CORS_ORIGINS', '')
 if additional_origins:
     allowed_origins.extend([origin.strip() for origin in additional_origins.split(',') if origin.strip()])
 
-CORS(app, supports_credentials=True)
+CORS(app, origins=allowed_origins, supports_credentials=True)
+
+flask_env = os.environ.get('FLASK_ENV', 'development')
+is_development = flask_env == 'development'
 
 secret_key = os.environ.get('FLASK_SECRET_KEY')
 if not secret_key:
-    raise RuntimeError("FLASK_SECRET_KEY is required in production for session management")
+    if is_development:
+        secret_key = 'dev-secret-key-change-in-production'
+        logger.warning("Using default secret key for development. DO NOT use in production!")
+    else:
+        raise RuntimeError("FLASK_SECRET_KEY is required in production for session management")
 app.secret_key = secret_key
 
-is_development = os.environ.get('FLASK_ENV', 'development') == 'development'
+# Session cookie configuration based on environment
 if is_development:
+    # Development: Local HTTP environment
     app.config['SESSION_COOKIE_HTTPONLY'] = True
     app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+    app.config['SESSION_COOKIE_SECURE'] = False
+    logger.info("Running in DEVELOPMENT mode - cookies configured for HTTP")
 else:
-    app.config['SESSION_COOKIE_HTTPONLY'] = False  # Allow JavaScript access for cross-origin
-    app.config['SESSION_COOKIE_SAMESITE'] = 'None' #Allow cross-origin cookies
-# Configure session cookies for cross-origin requests (Vercel <-> EC2/ngrok)
-app.config['SESSION_COOKIE_SECURE'] = False
+    # Production: HTTPS with cross-origin support
+    app.config['SESSION_COOKIE_HTTPONLY'] = True
+    app.config['SESSION_COOKIE_SAMESITE'] = 'None'  # Required for cross-origin cookies
+    app.config['SESSION_COOKIE_SECURE'] = True  # Required when SameSite=None
+    logger.info("Running in PRODUCTION mode - cookies configured for HTTPS")
+
 app.config['PERMANENT_SESSION_LIFETIME'] = 86400  # 24 hours
 app.config['SESSION_COOKIE_NAME'] = 'session'
 app.config['SESSION_COOKIE_DOMAIN'] = None
@@ -80,7 +93,8 @@ def login_route():
         share_list = json.loads(share_list)
         
         response = jsonify({
-            'result': result.name,
+            'message': result.name,
+            'result': result.name,  # Keep for backward compatibility
             'root': root_json,
             'share_list': share_list
         })
@@ -88,7 +102,7 @@ def login_route():
         logger.info(f"Response headers: {dict(response.headers)}")
         return response, 200
 
-    return jsonify({'result': result.name}), 401
+    return jsonify({'message': result.name, 'result': result.name}), 401
 
 @app.route('/signup', methods=['POST'])
 def signup_route():
@@ -99,10 +113,11 @@ def signup_route():
     if result == ErrorCode.SUCCESS:
         return jsonify({
             'ok': "true",
-            'result': result.name
+            'message': result.name,
+            'result': result.name  # Keep for backward compatibility
         }), 200
 
-    return jsonify({'result': result.name}), 401
+    return jsonify({'message': result.name, 'result': result.name}), 401
 
 @app.route('/create-folder', methods=['POST'])
 @login_required
@@ -199,6 +214,32 @@ def delete_user_route():
 def logout_route():
     session.pop('username', None)
     return jsonify({'message': ErrorCode.SUCCESS.name}), 200
+
+@app.route('/auth-status', methods=['GET'])
+def auth_status():
+    """Check if user has a valid session and return user data if authenticated"""
+    if 'username' in session:
+        username = session['username']
+        try:
+            root_json = get_kv(username + " ROOT")
+            share_list = get_kv(username + " SHARE_MANAGER")
+
+            if root_json and share_list and root_json != "\n" and share_list != "\n":
+                return jsonify({
+                    'authenticated': True,
+                    'username': username,
+                    'root': json.loads(root_json),
+                    'share_list': json.loads(share_list)
+                }), 200
+            else:
+                session.pop('username', None)
+                return jsonify({'authenticated': False}), 401
+        except Exception as e:
+            logger.error(f"Error checking auth status: {e}")
+            session.pop('username', None)
+            return jsonify({'authenticated': False}), 401
+
+    return jsonify({'authenticated': False}), 401
 
 
 @app.route('/upload', methods=['POST'])
@@ -399,6 +440,90 @@ def download_route():
         as_attachment=True,
         download_name=file_obj.filename
     )
+
+def collect_files_recursively(node, current_path=''):
+    """
+    Recursively collect all files from a folder node.
+    Returns a list of tuples: (relative_path, file_obj)
+    """
+    files = []
+
+    if node.is_folder:
+        for child_name, child_node in node.children.items():
+            child_path = f"{current_path}/{child_name}" if current_path else child_name
+            if child_node.is_folder:
+                # Recursively collect from subfolders
+                files.extend(collect_files_recursively(child_node, child_path))
+            else:
+                # Add file to the list
+                if child_node.file_obj:
+                    files.append((child_path, child_node.file_obj))
+
+    return files
+
+@app.route('/download-zip', methods=['POST'])
+@login_required
+def download_zip_route():
+    """Download a folder as a ZIP file."""
+    data = request.get_json()
+    if not data or 'path' not in data:
+        return jsonify({'message': ErrorCode.INVALID_PATH.name}), 400
+
+    path = data['path']
+    username = session['username']
+    is_shared = data.get('is_shared', False)
+
+    # Find the target folder
+    if is_shared:
+        share_manager = ShareManager.from_json(get_kv(username + " SHARE_MANAGER"))
+        target_node = share_manager.find_node_by_path(path)
+    else:
+        root = Node.from_json(get_kv(username + " ROOT"))
+        target_node = root.find_node_by_path(path)
+
+    if target_node is None:
+        return jsonify({'message': ErrorCode.NODE_NOT_FOUND.name}), 404
+
+    if not target_node.is_folder:
+        return jsonify({'message': 'Path is not a folder'}), 400
+
+    # Collect all files recursively
+    files_to_zip = collect_files_recursively(target_node)
+
+    if not files_to_zip:
+        return jsonify({'message': 'Folder is empty'}), 400
+
+    # Create ZIP file in memory
+    zip_buffer = BytesIO()
+
+    try:
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for relative_path, file_obj in files_to_zip:
+                # Download file from IPFS
+                file_content = download_file_from_ipfs(file_obj.cid)
+
+                if file_content and file_content.get("success"):
+                    # Add file to ZIP
+                    zip_file.writestr(relative_path, file_content["file"].getvalue())
+                else:
+                    logger.warning(f"Failed to download file: {relative_path}")
+
+        zip_buffer.seek(0)
+
+        # Get folder name for the zip file
+        folder_name = path.split('/')[-1] if path else 'files'
+
+        return send_file(
+            zip_buffer,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name=f"{folder_name}.zip"
+        )
+
+    except Exception as e:
+        logger.error(f"Error creating ZIP file: {str(e)}")
+        return jsonify({'message': 'Failed to create ZIP file'}), 500
+
 @app.route('/', methods=['GET'])
 def health_route():
     return jsonify({'message': 'OK'}), 200
