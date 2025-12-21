@@ -35,6 +35,7 @@ export const authAPI = {
       headers: {
         'Content-Type': 'application/json',
       },
+      credentials: 'include',
       body: JSON.stringify({ username, password }),
     });
     console.log("Signup response", response);
